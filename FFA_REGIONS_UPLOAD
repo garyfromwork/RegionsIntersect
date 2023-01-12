@@ -1,0 +1,204 @@
+create or replace PROCEDURE                           "FFA_REGIONS_UPLOAD" (RUNDATE IN DATE DEFAULT SYSDATE) AS 
+/*******************************************************************************************************
+**  Description: @ The FFA_REGIONS_UPLOAD procedure generates                                         **
+**  a comma delimited txt file of which is placed in the sfadata/frio directory                       **
+**  in the format regions_upload_dd-mon-yy.csv                                                        **
+**                                                                                                    **
+**  The file is then used for uploading to Regions for Bank 32 invoices.                              **
+**                                                                                                    **
+**  An email is then sent to the users with either the file, or a message explaining                  **
+**  that no data was found for the rundate specified.                                                 **
+**                                                                                                    **
+**  Developed at Stephen F. Austin State University                                                   **
+**  Author:  Randy Laird          Date: 16 Mar 2022                                                   **
+**                                                                                                    **
+**  Input Parameters:      @ RunDate (DD-MON-YY)                                                      **
+**     Return Value:      @ NONE                                                                      **
+**                                                                                                    **
+**  Change Date: 28-JUN-2022                                                                          **
+**  Change: Randy Laird                                                                               **
+**  Change Log: Removed check for FABINVH_INVOICE_TYPE_IND = 'D' as this is no longer needed.         **
+**  Change Date: 03-AUG-2022                                                                          **
+**  Change Log: Added in FARINVA_RUCL_CODE check to determine if credit or debit.                     **
+********************************************************************************************************/
+    lv_rundate        DATE := TO_DATE(rundate, 'dd-mon-yy');
+    lv_regions_rec    VARCHAR2(32676);
+    lv_regions_file   utl_file.FILE_TYPE;
+    lv_textLine       VARCHAR2(32000);
+    f_regions_upload  VARCHAR2(32000);
+    lv_inDir          VARCHAR2(100):='FRIO';
+    lv_records_found  BOOLEAN := FALSE;
+
+    LV_DB_NAME          VARCHAR2(4);
+    FFA_REGIONS_UPLOAD_FAILED EXCEPTION;
+    FFA_REGIONS_FAILED EXCEPTION;
+
+    CURSOR C_REGIONS_UPLOAD IS 
+    WITH REGIONS AS (
+        SELECT 
+        (SELECT SPRIDEN_ID FROM SPRIDEN WHERE SPRIDEN_PIDM = FABINVH_VEND_PIDM AND SPRIDEN_CHANGE_IND IS NULL) MerchantCode,
+            FABINVH_VEND_INV_CODE InvoiceNumber,
+            TO_CHAR(FABINVH_INVOICE_DATE, 'MM/DD/YYYY') InvoiceDate,
+            (CASE WHEN FARINVA_RUCL_CODE = 'INEC' THEN '-' || TO_CHAR((SELECT TO_CHAR(sum(FARINVA_APPR_AMT)) FROM FARINVA WHERE FARINVA_INVH_CODE = FABINVH_CODE))
+                ELSE TO_CHAR((SELECT TO_CHAR(sum(FARINVA_APPR_AMT)) FROM FARINVA WHERE FARINVA_INVH_CODE = FABINVH_CODE)) END) InvoiceAmt,
+            FABINVH_POHD_CODE UDFValue1,
+            NULL UDFValue2,
+            NULL UDFValue3,
+            NULL UDFValue4
+        FROM fabinvh
+        LEFT JOIN FARINVA
+            ON FARINVA_INVH_CODE = FABINVH_CODE
+        WHERE FABINVH_BANK_CODE = '32'
+        AND FABINVH_ACTIVITY_DATE LIKE lv_rundate
+        AND FABINVH_CANCEL_IND <> 'Y'
+        AND FABINVH_CANCEL_DATE IS NULL
+        AND FABINVH_APPR_IND = 'Y'
+        AND FABINVH_COMPLETE_IND = 'Y'
+        AND FABINVH_OPEN_PAID_IND = 'P'
+        AND FABINVH_VEND_INV_CODE != 'MULTIPLE'
+    ),
+    REGIONS_MULTIPLE_INVOICES AS (
+        SELECT 
+        (SELECT SPRIDEN_ID FROM SPRIDEN WHERE SPRIDEN_PIDM = FABINVH_VEND_PIDM AND SPRIDEN_CHANGE_IND IS NULL) MerchantCode,
+            FARVINV_VEND_INV_CODE InvoiceNumber,
+            TO_CHAR(FABINVH_INVOICE_DATE, 'MM/DD/YYYY') InvoiceDate,
+            (CASE WHEN FARINVA_RUCL_CODE = 'INEC' THEN '-' || TO_CHAR(FARVINV_VEND_INV_TOTAL)
+                ELSE TO_CHAR(FARVINV_VEND_INV_TOTAL) END)InvoiceAmt,
+            FABINVH_POHD_CODE UDFValue1,
+            NULL UDFValue2,
+            NULL UDFValue3,
+            NULL UDFValue4
+        FROM fabinvh
+        LEFT JOIN FARVINV
+            ON FARVINV_INVH_CODE = FABINVH_CODE
+        LEFT JOIN FARINVA
+            ON FARINVA_INVH_CODE = FABINVH_CODE
+        WHERE FABINVH_BANK_CODE = '32'
+        AND FABINVH_ACTIVITY_DATE LIKE lv_rundate
+        AND FABINVH_CANCEL_IND <> 'Y'
+        AND FABINVH_CANCEL_DATE IS NULL
+        AND FABINVH_APPR_IND = 'Y'
+        AND FABINVH_COMPLETE_IND = 'Y'
+        AND FABINVH_OPEN_PAID_IND = 'P'
+        AND FABINVH_VEND_INV_CODE = 'MULTIPLE'
+    ) 
+    SELECT TRIM(MerchantCode ||','||
+                      InvoiceNumber ||','||
+                      InvoiceDate ||','||
+                      InvoiceAmt ||','||
+                      UDFValue1 ||','||
+                      UDFValue2 ||','||
+                      UDFValue3 ||','||
+                      UDFValue4) AS PRINT_ROW
+    FROM REGIONS
+    UNION
+    SELECT TRIM(MerchantCode ||','||
+                      InvoiceNumber ||','||
+                      InvoiceDate ||','||
+                      InvoiceAmt ||','||
+                      UDFValue1 ||','||
+                      UDFValue2 ||','||
+                      UDFValue3 ||','||
+                      UDFValue4) AS PRINT_ROW
+    FROM REGIONS_MULTIPLE_INVOICES;
+BEGIN
+    DBMS_OUTPUT.ENABLE(NULL);
+    SELECT  get_dbname(1)
+      INTO  LV_DB_NAME 
+      FROM  dual;
+
+    lv_regions_file := utl_file.fopen('FRIO', 'regions_upload_' || lv_rundate || '.csv', 'w');
+
+    --  Read data into cursor. 
+   FOR lv_regions_r IN c_regions_upload LOOP
+      lv_records_found := true;
+      /* First, fetch the current record reported and insert it into the regions_upload.csv file. */
+      BEGIN
+          lv_regions_rec := lv_regions_r.PRINT_ROW;                          
+          utl_file.put_line(lv_regions_file, lv_regions_rec); 
+          dbms_output.put_line('FFA_REGIONS_UPLOAD Record Reported: '||lv_regions_rec); 
+      EXCEPTION
+        WHEN NO_DATA_FOUND THEN 
+                dbms_output.put_line('FFA_REGIONS_UPLOAD ERROR: NO_DATA_FOUND');
+        WHEN OTHERS THEN
+                dbms_output.put_line('FFA_REGIONS_UPLOAD ERROR: ' || SQLERRM);
+                dbms_output.put_line(dbms_utility.format_error_backtrace);
+                RAISE FFA_REGIONS_FAILED;
+      END;          
+   END LOOP;
+
+   utl_file.fclose(lv_regions_file);
+
+   IF lv_records_found THEN
+      lv_regions_file := utl_file.fopen('FRIO', 'regions_upload_' || lv_rundate || '.csv', 'R');
+      LOOP
+        BEGIN
+         UTL_FILE.get_line(lv_regions_file, lv_textLine);
+         f_regions_upload := f_regions_upload || lv_textLine || UTL_TCP.crlf;
+        EXCEPTION
+         WHEN NO_DATA_FOUND THEN
+            EXIT;
+        END;
+      END LOOP;
+
+      UTL_FILE.fclose(lv_regions_file);
+      IF (LV_DB_NAME = 'PROD') THEN
+          utl_mail.send_attach_raw
+                (sender        => 'sender',
+                 recipients    => 'recipients',
+                 cc            => 'email addresses',
+                 subject       => 'Regions Upload File - Bank', 
+                 message       => 'The attached Regions Upload File for Bank has been created for date: ' || lv_RUNDATE||'.' || CHR(13) || CHR(13)
+                                    || 'Please review this file for any errors.'  || CHR(13) || CHR(13)
+                                    || 'Note: This file is to be uploaded to Regions at https://intersect.regions.com/welcome.aspx?ReturnUrl=%2f', 
+                attachment     => UTL_RAW.CAST_TO_RAW(f_regions_upload),
+                att_filename   => 'regions_upload_' || lv_rundate || '.csv');
+        ELSE
+            utl_mail.send_attach_raw
+                (sender        => 'sender',
+                 recipients    => 'recipients',
+--                 cc            => '',
+                 subject       => 'Regions Upload File - Bank', 
+                 message       => 'The attached Regions Upload File for Bank 32 has been created for date: ' || lv_RUNDATE||'.' || CHR(13) || CHR(13)
+                                    || 'Please review this file for any errors.'  || CHR(13) || CHR(13)
+                                    || 'Note: This file is to be uploaded to Regions at https://intersect.regions.com/welcome.aspx?ReturnUrl=%2f', 
+                attachment     => UTL_RAW.CAST_TO_RAW(f_regions_upload),
+                att_filename   => 'regions_upload_' || lv_rundate || '.csv');
+        END IF;
+    ELSE
+        dbms_output.put_line('FFA_REGIONS_UPLOAD *** Aborting *** - No records to upload for rundate: ' || lv_rundate);
+        utl_mail.send(
+            sender         => 'sender', 
+            recipients     => 'recipients',
+            cc             => 'ccs',
+            subject        => 'Regions Upload File - Bank', 
+            message        => 'No Bank invoices were found on rundate: ' || lv_rundate || CHR(13)||CHR(13)|| 'Please try again or contact Finance department for assistance.'
+        );
+    END IF;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    utl_file.fclose(lv_regions_file); 
+    dbms_output.put_line('FFA_REGIONS_UPLOAD error NO DATA FOUND');    
+    RAISE FFA_REGIONS_UPLOAD_FAILED;
+  WHEN OTHERS THEN
+    dbms_output.put_line('FFA_REGIONS_UPLOAD error SQLERRM: '||SQLERRM);
+    utl_file.fclose(lv_regions_file); 
+
+--email programmers with error
+  IF (LV_DB_NAME = 'PROD') THEN
+    utl_mail.send(
+         sender      => 'sender',
+         recipients   => 'recipients',
+         subject     => 'FFA_REGIONS_UPLOAD ERROR',
+         message     => 'FFA_REGIONS_UPLOAD_FAILED error SQLERRM: '|| SQLERRM || CHR(13) || CHR(13)
+    );
+  ELSE
+    utl_mail.send(
+         sender      => 'sender',
+         recipients   => 'recipients',
+         subject     => 'FFA_REGIONS_UPLOAD ERROR',
+         message     => 'FFA_REGIONS_UPLOAD_FAILED error SQLERRM: '|| SQLERRM || CHR(13) || CHR(13)
+    );
+  END IF;
+  RAISE FFA_REGIONS_UPLOAD_FAILED; 
+END FFA_REGIONS_UPLOAD;
